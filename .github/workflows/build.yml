@@ -24,7 +24,7 @@ jobs:
           python -m pip install pyinstaller pywin32 openpyxl
 
       - name: Build EXE
-        run: pyinstaller --onefile outlook_to_excel.py
+        run: pyinstaller --onefile script.py
 
       - name: Upload EXE as artifact
         uses: actions/upload-artifact@v6
