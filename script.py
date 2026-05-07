@@ -1,89 +1,98 @@
 import os
-import sys
+import tkinter as tk
+from tkinter import messagebox
 import win32com.client
 from openpyxl import Workbook
-from datetime import datetime
-
-# ── helpers ──────────────────────────────────────────────────────────────────
 
 def get_test_folder(inbox):
-    """Return the 'test' subfolder of *inbox*, or None if not found."""
-    for folder in inbox.Folders:
+    for i in range(inbox.Folders.Count):
+        folder = inbox.Folders.Item(i + 1)
         if folder.Name.strip().lower() == "test":
             return folder
     return None
 
-def iter_mail_items(folder):
-    """Yield MailItem objects from *folder* (skips non-mail items)."""
-    items = folder.Items
-    items.Sort("[ReceivedTime]", True)          # newest first
-    item = items.GetFirst()
-    while item:
-        try:
-            # olMailItem = 43
-            if item.Class == 43:
-                yield item
-        except Exception:
-            pass
-        item = items.GetNext()
+def run_task():
+    btn.config(state=tk.DISABLED, text="Running...")
+    root.update()
 
-# ── main ─────────────────────────────────────────────────────────────────────
-
-def main():
-    # Connect to a running Outlook instance (or launch one)
     try:
         outlook = win32com.client.Dispatch("Outlook.Application")
-        mapi    = outlook.GetNamespace("MAPI")
+        mapi = outlook.GetNamespace("MAPI")
+        mapi.Logon()
     except Exception as exc:
-        sys.exit(f"[ERROR] Could not connect to Outlook: {exc}")
+        messagebox.showerror("Error", f"Could not connect to Outlook:\n{exc}")
+        btn.config(state=tk.NORMAL, text="Run the task")
+        return
 
-    # olFolderInbox = 6  →  always the *current user's* inbox, never shared
     try:
         inbox = mapi.GetDefaultFolder(6)
     except Exception as exc:
-        sys.exit(f"[ERROR] Could not open default Inbox: {exc}")
+        messagebox.showerror("Error", f"Could not open Inbox:\n{exc}")
+        btn.config(state=tk.NORMAL, text="Run the task")
+        return
 
-    # Locate the 'test' subfolder
     test_folder = get_test_folder(inbox)
     if test_folder is None:
-        sys.exit("[ERROR] No subfolder named 'test' was found inside your Inbox.")
+        messagebox.showerror("Error", "No subfolder named 'test' found inside your Inbox.")
+        btn.config(state=tk.NORMAL, text="Run the task")
+        return
 
-    print(f"[INFO] Reading emails from: Inbox \\ {test_folder.Name}")
-
-    # Collect email data
     rows = []
-    for mail in iter_mail_items(test_folder):
-        try:
-            subject      = mail.Subject or "(no subject)"
-            received     = mail.ReceivedTime          # pywintypes.datetime
-            date_str     = received.strftime("%Y-%m-%d")
-            time_str     = received.strftime("%H:%M:%S")
-            rows.append((subject, date_str, time_str))
-        except Exception as e:
-            print(f"[WARNING] Skipped one item: {e}")
+    try:
+        items = test_folder.Items
+        items.Sort("[ReceivedTime]", True)
+        count = items.Count
+        for i in range(count):
+            try:
+                item = items.Item(i + 1)
+                # olMailItem = 43
+                if item.Class == 43:
+                    subject  = item.Subject or "(no subject)"
+                    received = item.ReceivedTime
+                    date_str = received.strftime("%Y-%m-%d")
+                    time_str = received.strftime("%H:%M:%S")
+                    rows.append((subject, date_str, time_str))
+            except Exception:
+                continue
+    except Exception as exc:
+        messagebox.showerror("Error", f"Failed to read emails:\n{exc}")
+        btn.config(state=tk.NORMAL, text="Run the task")
+        return
 
-    print(f"[INFO] Found {len(rows)} email(s).")
+    if not rows:
+        messagebox.showwarning("No emails", "The 'test' folder exists but contains no emails.")
+        btn.config(state=tk.NORMAL, text="Run the task")
+        return
 
-    # Build the output path
+    # Save to Excel
     downloads = os.path.join(os.path.expanduser("~"), "Downloads")
     out_dir   = os.path.join(downloads, "test folder")
     os.makedirs(out_dir, exist_ok=True)
     out_path  = os.path.join(out_dir, "outlook_emails.xlsx")
 
-    # Create workbook
     wb = Workbook()
     ws = wb.active
     ws.title = "Emails"
-
     ws.append(["Subject", "Date", "Time"])
-
     for row in rows:
         ws.append(list(row))
-
-    # Save
     wb.save(out_path)
-    print(f"[OK] Excel file saved to: {out_path}")
 
+    messagebox.showinfo("Done", f"✅ {len(rows)} email(s) exported to:\n{out_path}")
+    btn.config(state=tk.NORMAL, text="Run the task")
 
-if __name__ == "__main__":
-    main()
+# ── GUI ───────────────────────────────────────────────────────────────────────
+root = tk.Tk()
+root.title("Outlook → Excel")
+root.resizable(False, False)
+root.geometry("300x120")
+
+lbl = tk.Label(root, text="Export 'test' folder emails to Excel", pady=10)
+lbl.pack()
+
+btn = tk.Button(root, text="Run the task", command=run_task,
+                width=20, height=2, bg="#0078D4", fg="white",
+                font=("Arial", 10, "bold"), relief=tk.FLAT, cursor="hand2")
+btn.pack(pady=5)
+
+root.mainloop()
