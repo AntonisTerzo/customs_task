@@ -30,4 +30,4 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: outlook_to_excel
-          path: dist/outlook_to_excel.exe
+          path: dist/script.exe
