@@ -75,11 +75,10 @@ def run_task():
             try:
                 item = items.Item(i + 1)
                 if item.Class == 43:          # olMailItem = 43
-                    subject  = item.Subject or "(no subject)"
-                    received = item.ReceivedTime
-                    date_str = received.strftime("%Y-%m-%d")
-                    time_str = received.strftime("%H:%M:%S")
-                    rows.append((subject, date_str, time_str))
+                    subject      = item.Subject or "(no subject)"
+                    received     = item.ReceivedTime
+                    datetime_str = received.strftime("%Y/%m/%d %H:%M:%S")
+                    rows.append((subject, datetime_str))
             except Exception:
                 continue
     except Exception as exc:
@@ -105,7 +104,7 @@ def run_task():
     wb = Workbook()
     ws = wb.active
     ws.title = "Emails"
-    ws.append(["Subject", "Date", "Time"])
+    ws.append(["Subject", "Received"])
     for row in rows:
         ws.append(list(row))
     wb.save(out_path)
