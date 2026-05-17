@@ -1,18 +1,32 @@
-"""
-Reads emails from the 'PGTS' subfolder inside Archive (personal mailbox only)
-and writes Subject, Date, and Time to an Excel file saved at:
-    %USERPROFILE%\Downloads\PGTS\outlook_emails.xlsx
-
-Requirements:
-    pip install pywin32 openpyxl
-"""
-
 import os
 import tkinter as tk
 from tkinter import messagebox
 import win32com.client
 from openpyxl import Workbook
 
+FORMULA_CHARS = {"=", "+", "-", "@", "\t", "\r"}
+
+def sanitize_subject(subject):
+    """Replace a leading formula-injection character with underscore."""
+    if subject and subject[0] in FORMULA_CHARS:
+        subject = "_" + subject[1:]
+    return subject
+
+def resolve_output_path(out_dir, base_name="outlook_emails"):
+    """
+    Returns a unique file path inside out_dir.
+    If outlook_emails.xlsx already exists, tries outlook_emails(1).xlsx,
+    outlook_emails(2).xlsx, and so on until a free slot is found.
+    """
+    candidate = os.path.join(out_dir, f"{base_name}.xlsx")
+    if not os.path.exists(candidate):
+        return candidate
+    counter = 1
+    while True:
+        candidate = os.path.join(out_dir, f"{base_name}({counter}).xlsx")
+        if not os.path.exists(candidate):
+            return candidate
+        counter += 1
 
 def get_pgts_folder(mapi):
     """
@@ -68,6 +82,7 @@ def run_task():
 
     # Read emails
     rows = []
+    skipped = 0
     try:
         items = pgts_folder.Items
         items.Sort("[ReceivedTime]", True)
@@ -75,11 +90,12 @@ def run_task():
             try:
                 item = items.Item(i + 1)
                 if item.Class == 43:          # olMailItem = 43
-                    subject      = item.Subject or "(no subject)"
+                    subject      = sanitize_subject(item.Subject or "(no subject)")
                     received     = item.ReceivedTime
                     datetime_str = received.strftime("%Y/%m/%d %H:%M:%S")
                     rows.append((subject, datetime_str))
             except Exception:
+                skipped += 1
                 continue
     except Exception as exc:
         messagebox.showerror("Error", f"Failed to read emails:\n{exc}")
@@ -99,7 +115,7 @@ def run_task():
     downloads = os.path.join(os.path.expanduser("~"), "Downloads")
     out_dir   = os.path.join(downloads, "PGTS")
     os.makedirs(out_dir, exist_ok=True)
-    out_path  = os.path.join(out_dir, "outlook_emails.xlsx")
+    out_path  = resolve_output_path(out_dir)
 
     wb = Workbook()
     ws = wb.active
@@ -109,13 +125,16 @@ def run_task():
         ws.append(list(row))
     wb.save(out_path)
 
-    messagebox.showinfo("Done", f"{len(rows)} email(s) exported to:\n{out_path}")
+    summary = f"{len(rows)} email(s) exported to:\n{out_path}"
+    if skipped:
+        summary += f"\n\n{skipped} item(s) were skipped (non-email items)."
+    messagebox.showinfo("Done", summary)
     btn.config(state=tk.NORMAL, text="Run the task")
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
 root = tk.Tk()
-root.title("Outlook → Excel")
+root.title("Outlook -> Excel")
 root.resizable(False, False)
 root.geometry("300x120")
 
