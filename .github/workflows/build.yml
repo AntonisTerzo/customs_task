@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - main
+      - v2
 jobs:
   build:
     runs-on: windows-latest
@@ -16,17 +17,30 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller pywin32 openpyxl
-      - name: Build EXE
+          python -m pip install pyinstaller pywin32 openpyxl pypdf
+      - name: Build script.exe
+        if: github.ref == 'refs/heads/main'
         run: >
           pyinstaller --onefile --noconsole
           --hidden-import win32timezone
           --hidden-import win32com.client
           --hidden-import openpyxl
           script.py
-      - name: Upload EXE as artifact
+      - name: Build outlook_extract.exe
+        run: >
+          pyinstaller --onefile --noconsole
+          --hidden-import win32timezone
+          --hidden-import win32com.client
+          --hidden-import openpyxl
+          outlook_extract.py
+      - name: Upload script.exe
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v6
+        with:
+          name: script
+          path: dist/script.exe
+      - name: Upload outlook_extract.exe
         uses: actions/upload-artifact@v6
         with:
           name: outlook_to_excel
-          path: dist/script.exe
-          
+          path: dist/outlook_extract.exe
