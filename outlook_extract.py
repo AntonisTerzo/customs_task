@@ -1,9 +1,9 @@
 import os
+import ctypes
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import scrolledtext, messagebox
 import win32com.client
 from openpyxl import Workbook
-
 
 FORMULA_CHARS = {"=", "+", "-", "@", "\t", "\r"}
 
@@ -13,7 +13,27 @@ BE_FOLDERS = [
     ("BEBRU Export",         "BEBRU Export"),
     ("BEBRU 3rdparty ECS",   "ECS"),
 ]
+
 # ── Shared helpers ────────────────────────────────────────────────────────────
+
+def get_display_name():
+    """Return the user's Windows display name, trimmed and safe."""
+    try:
+        GetUserNameEx = ctypes.windll.secur32.GetUserNameExW
+        NameDisplay = 3
+        size = ctypes.pointer(ctypes.c_ulong(0))
+        GetUserNameEx(NameDisplay, None, size)
+        name_buffer = ctypes.create_unicode_buffer(size.contents.value)
+        GetUserNameEx(NameDisplay, name_buffer, size)
+        username = name_buffer.value or ""
+        # Trim company suffix, e.g. "Last, First / Company" -> "Last, First"
+        if "/" in username:
+            username = username.split("/")[0].strip()
+        if not username:
+            username = os.environ.get("USERNAME", "User")
+        return username
+    except Exception:
+        return os.environ.get("USERNAME", "User")
 
 def sanitize_subject(subject):
     """Replace a leading formula-injection character with underscore."""
@@ -21,10 +41,9 @@ def sanitize_subject(subject):
         subject = "_" + subject[1:]
     return subject
 
-
 def resolve_output_path(out_dir, base_name):
     """
-    Returns a unique file path inside out_dir.
+    Return a unique file path inside out_dir.
     If <base_name>.xlsx already exists, tries <base_name>(1).xlsx,
     (2).xlsx, and so on until a free slot is found.
     """
@@ -40,7 +59,7 @@ def resolve_output_path(out_dir, base_name):
 
 def read_folder_emails(folder):
     """
-    Returns (rows, skipped) for a given Outlook folder.
+    Return (rows, skipped) for a given Outlook folder.
     rows is a list of (subject, datetime_str) tuples.
     """
     rows = []
@@ -61,7 +80,7 @@ def read_folder_emails(folder):
     return rows, skipped
 
 def connect_outlook():
-    """Returns (mapi, error_message)."""
+    """Return (mapi, error_message)."""
     try:
         outlook = win32com.client.Dispatch("Outlook.Application")
         mapi = outlook.GetNamespace("MAPI")
@@ -74,8 +93,8 @@ def connect_outlook():
 
 def get_pgts_folder(mapi):
     """
-    Navigates to Archive/PGTS in the personal mailbox only.
-    Returns (folder, error_message). If found, error_message is None.
+    Navigate to Archive/PGTS in the personal mailbox only.
+    Return (folder, error_message). If found, error_message is None.
     """
     try:
         inbox = mapi.GetDefaultFolder(6)
@@ -100,38 +119,41 @@ def get_pgts_folder(mapi):
 
     return None, "The 'PGTS' subfolder was not found inside Archive."
 
-def run_pgts_task():
-    pgts_btn.config(state=tk.DISABLED, text="Running...")
-    be_btn.config(state=tk.DISABLED)
-    root.update()
+def run_pgts_task(log):
+    """Return (success, out_folder_path)."""
+    log("Starting PGTS task...")
+    log("Connecting to Outlook...")
 
     mapi, err = connect_outlook()
     if err:
+        log(f"ERROR: {err}")
         messagebox.showerror("Error", err)
-        reset_buttons()
-        return
+        return False, None
 
+    log("Locating Archive/PGTS...")
     pgts_folder, err = get_pgts_folder(mapi)
     if pgts_folder is None:
+        log(f"ERROR: {err}")
         messagebox.showerror("Folder Not Found", err)
-        reset_buttons()
-        return
+        return False, None
 
+    log("Reading emails...")
     try:
         rows, skipped = read_folder_emails(pgts_folder)
     except Exception as exc:
+        log(f"ERROR: Failed to read emails: {exc}")
         messagebox.showerror("Error", f"Failed to read emails:\n{exc}")
-        reset_buttons()
-        return
+        return False, None
 
     if not rows:
+        log("Folder is empty.")
         messagebox.showwarning(
             "Empty Folder",
             "The Archive/PGTS folder was found but contains no emails."
         )
-        reset_buttons()
-        return
+        return False, None
 
+    log(f"Found {len(rows)} email(s). Writing Excel file...")
     downloads = os.path.join(os.path.expanduser("~"), "Downloads")
     out_dir   = os.path.join(downloads, "PGTS")
     os.makedirs(out_dir, exist_ok=True)
@@ -145,19 +167,21 @@ def run_pgts_task():
         ws.append(list(row))
     wb.save(out_path)
 
+    log(f"Saved to: {out_path}")
+    if skipped:
+        log(f"{skipped} item(s) skipped (non-email items).")
+    log("PGTS task complete.")
+
     summary = f"{len(rows)} email(s) exported to:\n{out_path}"
     if skipped:
         summary += f"\n\n{skipped} item(s) were skipped (non-email items)."
-    messagebox.showinfo("Done", summary)
-    reset_buttons()
+    messagebox.showinfo("PGTS Complete", summary)
+    return True, out_dir
 
 # ── BE task ───────────────────────────────────────────────────────────────────
 
 def find_inbox_subfolder(inbox, target_name):
-    """
-    Finds a direct subfolder of Inbox by name (case-insensitive, whitespace-tolerant).
-    Returns the folder object or None.
-    """
+    """Return the direct subfolder of Inbox matching name, or None."""
     target = target_name.strip().lower()
     for i in range(inbox.Folders.Count):
         f = inbox.Folders.Item(i + 1)
@@ -165,45 +189,46 @@ def find_inbox_subfolder(inbox, target_name):
             return f
     return None
 
-
-def run_be_task():
-    be_btn.config(state=tk.DISABLED, text="Running...")
-    pgts_btn.config(state=tk.DISABLED)
-    root.update()
+def run_be_task(log):
+    """Return (success, out_folder_path)."""
+    log("Starting BE task...")
+    log("Connecting to Outlook...")
 
     mapi, err = connect_outlook()
     if err:
+        log(f"ERROR: {err}")
         messagebox.showerror("Error", err)
-        reset_buttons()
-        return
+        return False, None
 
     try:
         inbox = mapi.GetDefaultFolder(6)
     except Exception as exc:
+        log(f"ERROR: Could not access Inbox: {exc}")
         messagebox.showerror("Error", f"Could not access Inbox:\n{exc}")
-        reset_buttons()
-        return
+        return False, None
 
-    # Build workbook with one sheet per configured folder
     wb = Workbook()
-    wb.remove(wb.active)      # remove default empty sheet
+    wb.remove(wb.active)          # remove default empty sheet
 
     report_lines = []
     total_rows = 0
     total_skipped = 0
 
     for folder_name, sheet_name in BE_FOLDERS:
+        log(f"Processing '{folder_name}'...")
         ws = wb.create_sheet(title=sheet_name)
         ws.append(["Subject", "Received"])
 
         folder = find_inbox_subfolder(inbox, folder_name)
         if folder is None:
+            log(f"  NOT FOUND - creating empty sheet")
             report_lines.append(f"- {folder_name}: NOT FOUND (empty sheet created)")
             continue
 
         try:
             rows, skipped = read_folder_emails(folder)
         except Exception as exc:
+            log(f"  ERROR reading: {exc}")
             report_lines.append(f"- {folder_name}: ERROR reading ({exc})")
             continue
 
@@ -214,19 +239,24 @@ def run_be_task():
         total_skipped += skipped
 
         if not rows:
+            log("  Empty - only headers written")
             report_lines.append(f"- {folder_name}: EMPTY (headers only)")
         else:
             note = f"- {folder_name}: {len(rows)} email(s)"
             if skipped:
                 note += f", {skipped} skipped"
             report_lines.append(note)
+            log(f"  {len(rows)} email(s) written" + (f", {skipped} skipped" if skipped else ""))
 
-    # Save workbook
+    log("Writing Excel file...")
     downloads = os.path.join(os.path.expanduser("~"), "Downloads")
     out_dir   = os.path.join(downloads, "BE")
     os.makedirs(out_dir, exist_ok=True)
     out_path  = resolve_output_path(out_dir, "be_emails")
     wb.save(out_path)
+
+    log(f"Saved to: {out_path}")
+    log("BE task complete.")
 
     summary  = "BE export complete.\n\n"
     summary += "\n".join(report_lines)
@@ -234,32 +264,120 @@ def run_be_task():
     if total_skipped:
         summary += f", {total_skipped} skipped"
     summary += f"\nSaved to:\n{out_path}"
-    messagebox.showinfo("Done", summary)
-    reset_buttons()
+    messagebox.showinfo("BE Complete", summary)
+    return True, out_dir
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
 
-def reset_buttons():
-    pgts_btn.config(state=tk.NORMAL, text="PGTS")
-    be_btn.config(state=tk.NORMAL, text="BE")
+class OutlookExporterGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Outlook -> Excel")
+        self.root.geometry("700x520")
 
-root = tk.Tk()
-root.title("Outlook -> Excel")
-root.resizable(False, False)
-root.geometry("320x180")
+        username = get_display_name()
 
-lbl = tk.Label(root, text="Export Outlook emails to Excel", pady=10,
-               font=("Arial", 10))
-lbl.pack()
+        # Welcome message
+        welcome_label = tk.Label(
+            root,
+            text=f"Welcome back {username}",
+            font=("Arial", 18, "bold"),
+            fg="#2C3E50"
+        )
+        welcome_label.pack(pady=20)
 
-pgts_btn = tk.Button(root, text="PGTS", command=run_pgts_task,
-                     width=20, height=2, bg="#0078D4", fg="white",
-                     font=("Arial", 10, "bold"), relief=tk.FLAT, cursor="hand2")
-pgts_btn.pack(pady=4)
+        # Buttons frame
+        buttons_frame = tk.Frame(root)
+        buttons_frame.pack(pady=10)
 
-be_btn = tk.Button(root, text="BE", command=run_be_task,
-                   width=20, height=2, bg="#107C10", fg="white",
-                   font=("Arial", 10, "bold"), relief=tk.FLAT, cursor="hand2")
-be_btn.pack(pady=4)
+        self.pgts_button = tk.Button(
+            buttons_frame,
+            text="PGTS",
+            command=self.start_pgts,
+            font=("Arial", 12, "bold"),
+            bg="#5DADE2",
+            fg="white",
+            width=15,
+            height=1,
+            relief="raised",
+            borderwidth=3,
+            cursor="hand2"
+        )
+        self.pgts_button.grid(row=0, column=0, padx=10)
 
-root.mainloop()
+        self.be_button = tk.Button(
+            buttons_frame,
+            text="BE",
+            command=self.start_be,
+            font=("Arial", 12, "bold"),
+            bg="#5DADE2",
+            fg="white",
+            width=15,
+            height=1,
+            relief="raised",
+            borderwidth=3,
+            cursor="hand2"
+        )
+        self.be_button.grid(row=0, column=1, padx=10)
+
+        # Log output area
+        log_label = tk.Label(root, text="Log Output:", font=("Arial", 10, "bold"))
+        log_label.pack(pady=(20, 5))
+
+        self.log_text = scrolledtext.ScrolledText(
+            root, width=75, height=18, state="disabled")
+        self.log_text.pack(pady=10)
+
+    def log(self, message):
+        self.log_text.config(state="normal")
+        self.log_text.insert(tk.END, message + "\n")
+        self.log_text.see(tk.END)
+        self.log_text.config(state="disabled")
+        self.root.update()
+
+    def clear_log(self):
+        self.log_text.config(state="normal")
+        self.log_text.delete(1.0, tk.END)
+        self.log_text.config(state="disabled")
+
+    def disable_buttons(self):
+        self.pgts_button.config(state="disabled")
+        self.be_button.config(state="disabled")
+
+    def enable_buttons(self):
+        self.pgts_button.config(state="normal", text="PGTS")
+        self.be_button.config(state="normal", text="BE")
+
+    def start_pgts(self):
+        self.disable_buttons()
+        self.pgts_button.config(text="Processing...")
+        self.clear_log()
+        try:
+            success, folder_path = run_pgts_task(self.log)
+            if success and folder_path:
+                os.startfile(folder_path)
+        except Exception as exc:
+            self.log(f"ERROR: {exc}")
+            messagebox.showerror("Error", f"An error occurred: {exc}")
+        finally:
+            self.enable_buttons()
+
+    def start_be(self):
+        self.disable_buttons()
+        self.be_button.config(text="Processing...")
+        self.clear_log()
+        try:
+            success, folder_path = run_be_task(self.log)
+            if success and folder_path:
+                os.startfile(folder_path)
+        except Exception as exc:
+            self.log(f"ERROR: {exc}")
+            messagebox.showerror("Error", f"An error occurred: {exc}")
+        finally:
+            self.enable_buttons()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = OutlookExporterGUI(root)
+    root.mainloop()
+    
