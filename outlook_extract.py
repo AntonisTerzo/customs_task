@@ -1,17 +1,25 @@
 import os
+import gc
 import ctypes
+import threading
+import traceback
 import tkinter as tk
 from tkinter import scrolledtext, messagebox
+import pythoncom
 import win32com.client
 from openpyxl import Workbook
 
 FORMULA_CHARS = {"=", "+", "-", "@", "\t", "\r"}
 
-# BE task configuration: (folder name in Inbox, sheet name in Excel)
-BE_FOLDERS = [
-    ("POA Registration",     "POA"),
-    ("BEBRU Export",         "BEBRU Export"),
-    ("BEBRU 3rdparty ECS",   "ECS"),
+PGTS_SHARED_MAILBOX = "nlcustomsskg.kngs / Kuehne-Nagel / SKG"          
+PGTS_SUBFOLDER      = "PGTS"    
+
+BE_SHARED_MAILBOX   = "belux.customs"     
+
+BE_PATHS = [
+    (["Control Tower", "BEBRU", "BEBRU Export"], "BEBRU Export"),
+    (["Control Tower Thessaloniki", "BEBRU 3rdparty ECS"],         "ECS"),
+    (["POA Registration"],                       "POA"),
 ]
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -26,7 +34,6 @@ def get_display_name():
         name_buffer = ctypes.create_unicode_buffer(size.contents.value)
         GetUserNameEx(NameDisplay, name_buffer, size)
         username = name_buffer.value or ""
-        # Trim company suffix, e.g. "Last, First / Company" -> "Last, First"
         if "/" in username:
             username = username.split("/")[0].strip()
         if not username:
@@ -44,8 +51,7 @@ def sanitize_subject(subject):
 def resolve_output_path(out_dir, base_name):
     """
     Return a unique file path inside out_dir.
-    If <base_name>.xlsx already exists, tries <base_name>(1).xlsx,
-    (2).xlsx, and so on until a free slot is found.
+    If <base_name>.xlsx already exists, tries <base_name>(1).xlsx, etc.
     """
     candidate = os.path.join(out_dir, f"{base_name}.xlsx")
     if not os.path.exists(candidate):
@@ -57,11 +63,8 @@ def resolve_output_path(out_dir, base_name):
             return candidate
         counter += 1
 
-def read_folder_emails(folder):
-    """
-    Return (rows, skipped) for a given Outlook folder.
-    rows is a list of (subject, datetime_str) tuples.
-    """
+def read_folder_emails(folder, log):
+    """Return (rows, skipped) for a given Outlook folder."""
     rows = []
     skipped = 0
     items = folder.Items
@@ -74,198 +77,246 @@ def read_folder_emails(folder):
                 received     = item.ReceivedTime
                 datetime_str = received.strftime("%Y/%m/%d %H:%M:%S")
                 rows.append((subject, datetime_str))
-        except Exception:
+        except Exception as exc:
             skipped += 1
+            log(f"  WARNING: Skipped item #{i + 1} ({type(exc).__name__}: {exc})")
             continue
     return rows, skipped
 
 def connect_outlook():
-    """Return (mapi, error_message)."""
+    """Return (outlook, mapi, error_message)."""
     try:
         outlook = win32com.client.Dispatch("Outlook.Application")
         mapi = outlook.GetNamespace("MAPI")
         mapi.Logon()
-        return mapi, None
+        return outlook, mapi, None
     except Exception as exc:
-        return None, f"Could not connect to Outlook:\n{exc}"
+        return None, None, f"Could not connect to Outlook:\n{exc}"
 
-# ── PGTS task ─────────────────────────────────────────────────────────────────
+def release_com():
+    """Force garbage collection to release lingering COM references."""
+    gc.collect()
 
-def get_pgts_folder(mapi):
+# ── Shared mailbox navigation ─────────────────────────────────────────────────
+
+def find_shared_store(mapi, store_name):
     """
-    Navigate to Archive/PGTS in the personal mailbox only.
-    Return (folder, error_message). If found, error_message is None.
+    Find a top-level shared mailbox by its display name.
+    Returns (store_root_folder, error_message).
     """
+    target = store_name.strip().lower()
     try:
-        inbox = mapi.GetDefaultFolder(6)
-        store_root = inbox.Parent          # root of the personal mailbox
+        for i in range(mapi.Folders.Count):
+            store = mapi.Folders.Item(i + 1)
+            if store.Name.strip().lower() == target:
+                return store, None
     except Exception as exc:
-        return None, f"Could not access personal mailbox:\n{exc}"
+        return None, f"Error listing mailboxes:\n{exc}"
+    return None, (f"Shared mailbox '{store_name}' was not found.\n"
+                  f"Make sure it is added to your Outlook profile.")
 
-    archive_folder = None
-    for i in range(store_root.Folders.Count):
-        f = store_root.Folders.Item(i + 1)
-        if f.Name.strip().lower() == "archive":
-            archive_folder = f
-            break
-
-    if archive_folder is None:
-        return None, "The 'Archive' folder was not found in your personal mailbox."
-
-    for i in range(archive_folder.Folders.Count):
-        f = archive_folder.Folders.Item(i + 1)
-        if f.Name.strip().upper() == "PGTS":
-            return f, None
-
-    return None, "The 'PGTS' subfolder was not found inside Archive."
-
-def run_pgts_task(log):
-    """Return (success, out_folder_path)."""
-    log("Starting PGTS task...")
-    log("Connecting to Outlook...")
-
-    mapi, err = connect_outlook()
-    if err:
-        log(f"ERROR: {err}")
-        messagebox.showerror("Error", err)
-        return False, None
-
-    log("Locating Archive/PGTS...")
-    pgts_folder, err = get_pgts_folder(mapi)
-    if pgts_folder is None:
-        log(f"ERROR: {err}")
-        messagebox.showerror("Folder Not Found", err)
-        return False, None
-
-    log("Reading emails...")
-    try:
-        rows, skipped = read_folder_emails(pgts_folder)
-    except Exception as exc:
-        log(f"ERROR: Failed to read emails: {exc}")
-        messagebox.showerror("Error", f"Failed to read emails:\n{exc}")
-        return False, None
-
-    if not rows:
-        log("Folder is empty.")
-        messagebox.showwarning(
-            "Empty Folder",
-            "The Archive/PGTS folder was found but contains no emails."
-        )
-        return False, None
-
-    log(f"Found {len(rows)} email(s). Writing Excel file...")
-    downloads = os.path.join(os.path.expanduser("~"), "Downloads")
-    out_dir   = os.path.join(downloads, "PGTS")
-    os.makedirs(out_dir, exist_ok=True)
-    out_path  = resolve_output_path(out_dir, "outlook_emails")
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Emails"
-    ws.append(["Subject", "Received"])
-    for row in rows:
-        ws.append(list(row))
-    wb.save(out_path)
-
-    log(f"Saved to: {out_path}")
-    if skipped:
-        log(f"{skipped} item(s) skipped (non-email items).")
-    log("PGTS task complete.")
-
-    summary = f"{len(rows)} email(s) exported to:\n{out_path}"
-    if skipped:
-        summary += f"\n\n{skipped} item(s) were skipped (non-email items)."
-    messagebox.showinfo("PGTS Complete", summary)
-    return True, out_dir
-
-# ── BE task ───────────────────────────────────────────────────────────────────
-
-def find_inbox_subfolder(inbox, target_name):
-    """Return the direct subfolder of Inbox matching name, or None."""
+def find_subfolder(parent_folder, target_name):
+    """Return the direct subfolder matching name, or None."""
     target = target_name.strip().lower()
-    for i in range(inbox.Folders.Count):
-        f = inbox.Folders.Item(i + 1)
+    for i in range(parent_folder.Folders.Count):
+        f = parent_folder.Folders.Item(i + 1)
         if f.Name.strip().lower() == target:
             return f
     return None
 
+def walk_path(root_folder, path_parts):
+    """
+    Walk a list of folder names starting from root_folder.
+    Returns (folder, error_message).
+    """
+    current = root_folder
+    walked = []
+    for name in path_parts:
+        nxt = find_subfolder(current, name)
+        if nxt is None:
+            walked_str = " / ".join(walked) if walked else "(root)"
+            return None, f"Subfolder '{name}' not found under '{walked_str}'."
+        current = nxt
+        walked.append(name)
+    return current, None
+
+# ── PGTS task ─────────────────────────────────────────────────────────────────
+
+def get_pgts_folder(mapi):
+    
+    store, err = find_shared_store(mapi, PGTS_SHARED_MAILBOX)
+    if store is None:
+        return None, err
+
+    inbox = find_subfolder(store, "Inbox")
+    if inbox is None:
+        return None, f"'Inbox' was not found inside shared mailbox '{PGTS_SHARED_MAILBOX}'."
+
+    pgts = find_subfolder(inbox, PGTS_SUBFOLDER)
+    if pgts is None:
+        return None, (f"Subfolder '{PGTS_SUBFOLDER}' was not found inside "
+                      f"'{PGTS_SHARED_MAILBOX}' / Inbox.")
+
+    return pgts, None
+
+def run_pgts_task(log):
+    log("Starting PGTS task...")
+    log("Connecting to Outlook...")
+
+    outlook = mapi = pgts_folder = None
+    try:
+        outlook, mapi, err = connect_outlook()
+        if err:
+            log(f"ERROR: {err}")
+            messagebox.showerror("Error", err)
+            return False, None
+
+        log(f"Locating '{PGTS_SHARED_MAILBOX}' / Inbox / {PGTS_SUBFOLDER}...")
+        pgts_folder, err = get_pgts_folder(mapi)
+        if pgts_folder is None:
+            log(f"ERROR: {err}")
+            messagebox.showerror("Folder Not Found", err)
+            return False, None
+
+        log("Reading emails...")
+        try:
+            rows, skipped = read_folder_emails(pgts_folder, log)
+        except Exception as exc:
+            log(f"ERROR: Failed to read emails: {exc}")
+            log(traceback.format_exc())
+            messagebox.showerror("Error", f"Failed to read emails:\n{exc}")
+            return False, None
+
+        if not rows:
+            log("Folder is empty.")
+            messagebox.showwarning(
+                "Empty Folder",
+                f"The folder '{PGTS_SHARED_MAILBOX} / Inbox / {PGTS_SUBFOLDER}' "
+                "was found but contains no emails."
+            )
+            return False, None
+
+        log(f"Found {len(rows)} email(s). Writing Excel file...")
+        downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+        out_dir   = os.path.join(downloads, "PGTS")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path  = resolve_output_path(out_dir, "outlook_emails")
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Emails"
+        ws.append(["Subject", "Received"])
+        for row in rows:
+            ws.append(list(row))
+        wb.save(out_path)
+
+        log(f"Saved to: {out_path}")
+        if skipped:
+            log(f"{skipped} item(s) skipped (see warnings above).")
+        log("PGTS task complete.")
+
+        summary = f"{len(rows)} email(s) exported to:\n{out_path}"
+        if skipped:
+            summary += f"\n\n{skipped} item(s) were skipped (see log)."
+        messagebox.showinfo("PGTS Complete", summary)
+        return True, out_dir
+    finally:
+        pgts_folder = None
+        mapi = None
+        outlook = None
+        release_com()
+
+# ── BE task ───────────────────────────────────────────────────────────────────
+
 def run_be_task(log):
-    """Return (success, out_folder_path)."""
     log("Starting BE task...")
     log("Connecting to Outlook...")
 
-    mapi, err = connect_outlook()
-    if err:
-        log(f"ERROR: {err}")
-        messagebox.showerror("Error", err)
-        return False, None
-
+    outlook = mapi = store = None
     try:
-        inbox = mapi.GetDefaultFolder(6)
-    except Exception as exc:
-        log(f"ERROR: Could not access Inbox: {exc}")
-        messagebox.showerror("Error", f"Could not access Inbox:\n{exc}")
-        return False, None
+        outlook, mapi, err = connect_outlook()
+        if err:
+            log(f"ERROR: {err}")
+            messagebox.showerror("Error", err)
+            return False, None
 
-    wb = Workbook()
-    wb.remove(wb.active)          # remove default empty sheet
+        log(f"Locating shared mailbox '{BE_SHARED_MAILBOX}'...")
+        store, err = find_shared_store(mapi, BE_SHARED_MAILBOX)
+        if store is None:
+            log(f"ERROR: {err}")
+            messagebox.showerror("Shared Mailbox Not Found", err)
+            return False, None
 
-    report_lines = []
-    total_rows = 0
-    total_skipped = 0
+        wb = Workbook()
+        wb.remove(wb.active)          # remove default empty sheet
 
-    for folder_name, sheet_name in BE_FOLDERS:
-        log(f"Processing '{folder_name}'...")
-        ws = wb.create_sheet(title=sheet_name)
-        ws.append(["Subject", "Received"])
+        report_lines = []
+        total_rows = 0
+        total_skipped = 0
 
-        folder = find_inbox_subfolder(inbox, folder_name)
-        if folder is None:
-            log(f"  NOT FOUND - creating empty sheet")
-            report_lines.append(f"- {folder_name}: NOT FOUND (empty sheet created)")
-            continue
+        for path_parts, sheet_name in BE_PATHS:
+            path_display = f"{BE_SHARED_MAILBOX} / " + " / ".join(path_parts)
+            log(f"Processing '{path_display}'...")
+            ws = wb.create_sheet(title=sheet_name)
+            ws.append(["Subject", "Received"])
 
-        try:
-            rows, skipped = read_folder_emails(folder)
-        except Exception as exc:
-            log(f"  ERROR reading: {exc}")
-            report_lines.append(f"- {folder_name}: ERROR reading ({exc})")
-            continue
+            folder, walk_err = walk_path(store, path_parts)
+            if folder is None:
+                log(f"  NOT FOUND: {walk_err}")
+                report_lines.append(f"- {path_display}: NOT FOUND (empty sheet created)")
+                continue
 
-        for row in rows:
-            ws.append(list(row))
+            try:
+                rows, skipped = read_folder_emails(folder, log)
+            except Exception as exc:
+                log(f"  ERROR reading: {exc}")
+                log(traceback.format_exc())
+                report_lines.append(f"- {path_display}: ERROR reading ({exc})")
+                folder = None
+                continue
 
-        total_rows += len(rows)
-        total_skipped += skipped
+            for row in rows:
+                ws.append(list(row))
 
-        if not rows:
-            log("  Empty - only headers written")
-            report_lines.append(f"- {folder_name}: EMPTY (headers only)")
-        else:
-            note = f"- {folder_name}: {len(rows)} email(s)"
-            if skipped:
-                note += f", {skipped} skipped"
-            report_lines.append(note)
-            log(f"  {len(rows)} email(s) written" + (f", {skipped} skipped" if skipped else ""))
+            total_rows += len(rows)
+            total_skipped += skipped
 
-    log("Writing Excel file...")
-    downloads = os.path.join(os.path.expanduser("~"), "Downloads")
-    out_dir   = os.path.join(downloads, "BE")
-    os.makedirs(out_dir, exist_ok=True)
-    out_path  = resolve_output_path(out_dir, "be_emails")
-    wb.save(out_path)
+            if not rows:
+                log("  Empty - only headers written")
+                report_lines.append(f"- {path_display}: EMPTY (headers only)")
+            else:
+                note = f"- {path_display}: {len(rows)} email(s)"
+                if skipped:
+                    note += f", {skipped} skipped"
+                report_lines.append(note)
+                log(f"  {len(rows)} email(s) written" +
+                    (f", {skipped} skipped" if skipped else ""))
 
-    log(f"Saved to: {out_path}")
-    log("BE task complete.")
+            folder = None       # release per-folder COM reference
 
-    summary  = "BE export complete.\n\n"
-    summary += "\n".join(report_lines)
-    summary += f"\n\nTotal: {total_rows} email(s) exported"
-    if total_skipped:
-        summary += f", {total_skipped} skipped"
-    summary += f"\nSaved to:\n{out_path}"
-    messagebox.showinfo("BE Complete", summary)
-    return True, out_dir
+        log("Writing Excel file...")
+        downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+        out_dir   = os.path.join(downloads, "BE")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path  = resolve_output_path(out_dir, "be_emails")
+        wb.save(out_path)
+
+        log(f"Saved to: {out_path}")
+        log("BE task complete.")
+
+        summary  = "BE export complete.\n\n"
+        summary += "\n".join(report_lines)
+        summary += f"\n\nTotal: {total_rows} email(s) exported"
+        if total_skipped:
+            summary += f", {total_skipped} skipped"
+        summary += f"\nSaved to:\n{out_path}"
+        messagebox.showinfo("BE Complete", summary)
+        return True, out_dir
+    finally:
+        store = None
+        mapi = None
+        outlook = None
+        release_com()
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
 
@@ -277,7 +328,6 @@ class OutlookExporterGUI:
 
         username = get_display_name()
 
-        # Welcome message
         welcome_label = tk.Label(
             root,
             text=f"Welcome back {username}",
@@ -286,7 +336,6 @@ class OutlookExporterGUI:
         )
         welcome_label.pack(pady=20)
 
-        # Buttons frame
         buttons_frame = tk.Frame(root)
         buttons_frame.pack(pady=10)
 
@@ -320,7 +369,6 @@ class OutlookExporterGUI:
         )
         self.be_button.grid(row=0, column=1, padx=10)
 
-        # Log output area
         log_label = tk.Label(root, text="Log Output:", font=("Arial", 10, "bold"))
         log_label.pack(pady=(20, 5))
 
@@ -329,11 +377,13 @@ class OutlookExporterGUI:
         self.log_text.pack(pady=10)
 
     def log(self, message):
+        self.root.after(0, self._append_log, message)
+
+    def _append_log(self, message):
         self.log_text.config(state="normal")
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
         self.log_text.config(state="disabled")
-        self.root.update()
 
     def clear_log(self):
         self.log_text.config(state="normal")
@@ -352,32 +402,48 @@ class OutlookExporterGUI:
         self.disable_buttons()
         self.pgts_button.config(text="Processing...")
         self.clear_log()
+        thread = threading.Thread(target=self._pgts_worker, daemon=True)
+        thread.start()
+
+    def _pgts_worker(self):
+        pythoncom.CoInitialize()
         try:
             success, folder_path = run_pgts_task(self.log)
             if success and folder_path:
-                os.startfile(folder_path)
+                self.root.after(0, os.startfile, folder_path)
         except Exception as exc:
             self.log(f"ERROR: {exc}")
-            messagebox.showerror("Error", f"An error occurred: {exc}")
+            self.log(traceback.format_exc())
+            self.root.after(0, messagebox.showerror,
+                            "Error", f"An error occurred: {exc}")
         finally:
-            self.enable_buttons()
+            pythoncom.CoUninitialize()
+            self.root.after(0, self.enable_buttons)
 
     def start_be(self):
         self.disable_buttons()
         self.be_button.config(text="Processing...")
         self.clear_log()
+        thread = threading.Thread(target=self._be_worker, daemon=True)
+        thread.start()
+
+    def _be_worker(self):
+        pythoncom.CoInitialize()
         try:
             success, folder_path = run_be_task(self.log)
             if success and folder_path:
-                os.startfile(folder_path)
+                self.root.after(0, os.startfile, folder_path)
         except Exception as exc:
             self.log(f"ERROR: {exc}")
-            messagebox.showerror("Error", f"An error occurred: {exc}")
+            self.log(traceback.format_exc())
+            self.root.after(0, messagebox.showerror,
+                            "Error", f"An error occurred: {exc}")
         finally:
-            self.enable_buttons()
+            pythoncom.CoUninitialize()
+            self.root.after(0, self.enable_buttons)
+
 
 if __name__ == "__main__":
     root = tk.Tk()
     app = OutlookExporterGUI(root)
     root.mainloop()
-    
