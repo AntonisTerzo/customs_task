@@ -11,14 +11,14 @@ from openpyxl import Workbook
 
 FORMULA_CHARS = {"=", "+", "-", "@", "\t", "\r"}
 
-PGTS_SHARED_MAILBOX = "nlcustomsskg.kngs / Kuehne-Nagel / SKG"          
+PGTS_SHARED_MAILBOX = "nlcustomsskg.kngs / Kuehne+Nagel / SKG"          
 PGTS_SUBFOLDER      = "PGTS"    
 
 BE_SHARED_MAILBOX   = "belux.customs"     
 
 BE_PATHS = [
-    (["Control Tower", "BEBRU", "BEBRU Export"], "BEBRU Export"),
-    (["Control Tower Thessaloniki", "BEBRU 3rdparty ECS"],         "ECS"),
+    (["1. Control Tower", "BEBRU", "BEBRU Export"], "BEBRU Export"),
+    (["1.2 Control Tower Thessaloniki", "BEBRU 3rdparty ECS"],         "ECS"),
     (["POA Registration"],                       "POA"),
 ]
 
